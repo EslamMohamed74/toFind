@@ -1,0 +1,326 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Area;
+use App\Attribute;
+use App\AttributeValue;
+use App\Category;
+use App\City;
+use App\DescriptionValidation;
+use App\Item;
+use App\ItemAttributeValue;
+use App\Notifications\NotifyReport;
+use Illuminate\Contracts\View\Factory;
+use Illuminate\Http\Request;
+use Illuminate\Http\Response;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Mail;
+use Illuminate\Support\Facades\Redirect;
+use Illuminate\View\View;
+
+class itemController extends Controller
+{
+    private $itemWithVal;
+
+    public function __construct()
+    {
+        $this->itemWithVal = "";
+    }
+    /**
+     * Display a listing of the resource.
+     *
+     * @return Factory|View
+     */
+
+    // isthere any role?
+    public function index()
+    {
+        $categories = Category::all();
+        $cities = City::all();
+        return view('items.find')->with([
+            'categories' => $categories,
+            'cities' => $cities
+        ]);
+
+    }
+
+    public function fetchAll()
+    {
+        $items = Item::with("category")->paginate(6);
+        return response()->json($items);
+    }
+
+    /**
+     * Show the form for creating a new resource.
+     *
+     * @return Response
+     */
+    public function create()
+    {
+        $items = Item::paginate(6);
+        $categories = Category::all();
+        $cities = City::all();
+        return view('items.form', [
+            'items' => $items,
+            'categories' => $categories,
+            'cities' => $cities,
+        ]);
+    }
+
+    /**
+     * Store a newly created resource in storage.
+     *
+     * @param Request $request
+     * @return Response
+     */
+    public function store(Request $request)
+    {
+        $this->validate($request, [
+            'city_id' => 'required',
+            'area_id' => 'required',
+            'category_id' => 'required',
+            'image' => 'required|mimes:jpeg,jpg,png|max:2024',
+            'found_since' => 'required',
+        ]);
+        DB::transaction(function () use ($request) {
+            $item = new Item();
+            $item->city_id = $request->input('city_id');
+            $item->area_id = $request->input('area_id');
+            $item->image = $this->uploadImageToS3("items/", $request->file('image'));
+            $item->category_id = $request->input('category_id');
+            $item->found_since = $request->input('found_since');
+            $item->user_id = auth()->user()->id;
+            $item->save();
+            foreach ($request->all() as $attribute => $value) {
+                if ($this->startsWith($attribute, "#")) {
+                    $this->itemWithVal = DB::table("_item_attribute_values")->insert([
+                        'item_id' => $item->id,
+                        'attribute_id' => (Attribute::where('attribute_name', '=', substr($attribute, 1))->first())->id,
+                        'value_id' => $value
+                    ]);
+                }
+            }
+        }, 1);
+        return Redirect::to("/items/search");
+    }
+
+    /**
+     * Display the specified resource.
+     *
+     * @param int $id
+     * @return Factory|View
+     */
+    public function show($item)
+    {
+        $itemAtributeValue = ItemAttributeValue::with("attribute")->with("value")->where("item_id", "=", $item)->get();
+        $item = Item::where("id", "=", $item)->first();
+        return view('items.itemDetails', [
+            'item' => $item,
+            'data' => $itemAtributeValue,
+        ]);
+    }
+
+    /**
+     * Show the form for editing the specified resource.
+     *
+     * @param int $id
+     * @return Factory|View
+     */
+    public function edit($item)
+    {
+        //you may put in transaction
+        $categories = Category::all();
+        $cities = City::all();
+        $areas = Area::all();
+        $itemAtributeValue = ItemAttributeValue::with("attribute")->with("value")->where("item_id", "=", $item)->get();
+        $attributesIds = array();
+        foreach ($itemAtributeValue as $key => $collection) {
+            array_push($attributesIds, $collection->attribute->id);
+        }
+        $globalAttributeValues = Attribute::with("values")->wherein("id", $attributesIds)->get();
+        $item = Item::find($item);
+        return view('user.editItemReport', [
+            'categories' => $categories,
+            'item' => $item,
+            'data' => $itemAtributeValue,
+            'cities' => $cities,
+            'areas' => $areas,
+            'globalAttributeValues' => $globalAttributeValues
+        ]);
+    }
+
+    //
+
+    /**
+     * Update the specified resource in storage.
+     *
+     * @param Request $request
+     * @param int $id
+     * @return Response
+     */
+    public function update(Request $request, Item $item)
+    {
+        if (auth()->user()->id == $item->user->id) {
+            if ($request->has('city_id')) {
+                $item->city_id = $request->city_id;
+            }
+            if ($request->has('area_id')) {
+                $item->area_id = $request->area_id;
+            }
+            if ($request->has('category_id')) {
+                $item->category_id = $request->category_id;
+            }
+
+            if ($request->has('found_since')) {
+                $item->found_since = $request->found_since;
+            }
+            if ($request->hasFile('image')) {
+                $this->deleteImageFromS3($item->image);
+                $item->image = $this->uploadImageToS3("items/", $request->file('image'));
+            }
+            $item->ItemAttributeValue()->delete();
+            foreach ($request->all() as $attribute => $value) {
+                if ($this->startsWith($attribute, "#")) {
+                    $this->itemWithVal = DB::table("_item_attribute_values")->insert([
+                        'item_id' => $item->id,
+                        'attribute_id' => (Attribute::where('attribute_name', '=', substr($attribute, 1))->first())->id,
+                        'value_id' => $value
+                    ]);
+                }
+            }
+            $item->save();
+            return redirect(route('profile.index'));
+        } else
+            return $this->errorResponse("Unauthorize", 403);
+    }
+
+    /**
+     * Remove the specified resource from storage.
+     *
+     * @param int $id
+     * @return Response
+     */
+    public function destroy(Item $item)
+    {
+        if (auth()->user()->id == $item->user->id || auth()->user()->hasRole('Admin')) {
+            $this->deleteImageFromS3($item->image);
+            $item->delete();
+            return redirect(route('profile.index'));
+        }
+    }
+
+
+    public function getAreaList(Request $request)
+    {
+        if (app()->getLocale() == 'ar') {
+            $states = DB::table("areas")
+                ->where("city_id", $request->city_id)
+                ->pluck("area_name_ar", "id");
+            return response()->json($states);
+        } else {
+            $states = DB::table("areas")
+                ->where("city_id", $request->city_id)
+                ->pluck("area_name", "id");
+            return response()->json($states);
+        }
+    }
+
+    public function CityCategory()
+    {
+        $cities = City::all();
+        $categories = Category::with('attributes')->get();
+        return view('items.form', compact('cities', 'categories'));
+    }
+
+    public function getAttributeList($id)
+    {
+        $category = Category::with('attributes')->where('id', '=', $id)->get();
+        return response()->json($category);
+
+    }
+
+    public function getAttributeValue($id)
+    {
+        $attribute = AttributeValue::with('attribute')->where('attribute_id', '=', $id)->get();
+        return response()->json($attribute);
+
+
+    }
+
+    public function showReportItems($id)
+    {
+        $item = Item::with('category')->where('id', '=', $id)->get();
+        return view('items.itemDetails', ['item' => $item]);
+    }
+
+    public function sendEmailVerifyItems(Request $request, $id)
+    {
+        $item = Item::with('user')->where('id', '=', $id)->first();
+        if (auth()->user()->id == $item->user->id) {
+            return redirect('showReportItem/' . $item->id)->with("message", "Sorry,You are same owner of item");
+        } else {
+            $descriptionValidation = new DescriptionValidation();
+            $descriptionValidation->lost_id = auth()->user()->id;
+            $descriptionValidation->founder_id = $item->user->id;
+            $descriptionValidation->description = $request->input('description');
+            $descriptionValidation->item_id = $item->id;
+            $descriptionValidation->save();
+            Mail::to($item->user->email)->send(new \App\Mail\NotifyItem($item, $descriptionValidation));
+            $item->update(["status" => 1]);
+            return redirect('/')->with("message", "Description has been send successfully");
+
+        }
+    }
+
+    public function AcceptMessage($decision, DescriptionValidation $descriptionValidation)
+    {
+        $value = '';
+        if ($decision == "accept")
+            $value = '1';
+        else if ($decision == "reject")
+            $value = '0';
+        DB::transaction(function () use ($value, $descriptionValidation) {
+            $descriptionValidation->update(['status' => $value]);
+            $item = Item::where("id", "=", $descriptionValidation->item_id)->first();
+            $item->status = 1;
+            $item->save();
+        });
+        return redirect('/')->with("message", "Thank you for using our App");
+    }
+
+    public function doSearchingQuery($data)
+    {
+        $dataObject = json_decode($data, true);
+        $constraints = (array)$dataObject;
+        $query = Item::query();
+        $fields = array_keys($constraints);
+        $index = 0;
+        foreach ($constraints as $constraint) {
+            if ($constraint != "" && !is_array($constraint)) {
+                $query = $query->with("category")->where($fields[$index], '=', $constraint);
+            }
+            $index++;
+        }
+        if (count($constraints['value_id']) == 0) {
+            $items = $query->paginate(6);
+            return response()->json($items);
+        } else {
+            $results = array();
+            $itemsIds = $query->pluck('id');
+            $values = $constraints['value_id'];
+            $result = DB::table('_item_attribute_values')->whereIn('item_id', $itemsIds)->where(function ($q) use ($values) {
+                $q->wherein("value_id", $values);
+            })->get()->groupBy("item_id");
+            foreach ($result as $key => $collection) {
+                if (count($collection) == count($values)) {
+                    array_push($results, $key);
+                }
+            }
+            $items = Item::with("category")->whereIn("id", $results)->paginate(6);
+            return response()->json($items);
+        }
+
+    }
+
+}
